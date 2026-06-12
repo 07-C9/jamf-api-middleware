@@ -50,6 +50,8 @@ lambda/
 
 The middleware is generic. `lambda_function.py` dispatches on an `action` field through an `ACTIONS` dict, and one action is included as the worked example: `erase`, which sends an MDM Erase All Content and Settings command with Bootstrap Token and obliteration-behavior safety checks. It's the action we run in production. Swap in or add your own.
 
+For a complete production consumer of this middleware (self-service EACS with SwiftDialog confirmations), see [jamf-self-service-eacs](https://github.com/07-C9/jamf-self-service-eacs).
+
 ## The client contract
 
 Any script on a managed device can call the middleware. It needs two things, both delivered as Jamf policy parameters: the gateway URL and an API key. The device reads its own identity locally, no admin rights needed:
