@@ -50,7 +50,7 @@ lambda/
 
 For a production consumer of this middleware, see [jamf-self-service-eacs](https://github.com/07-C9/jamf-self-service-eacs).
 
-## Client contract
+## Usage
 
 Any script on a managed device can call the middleware. It needs the gateway URL and an API key, both delivered as Jamf policy parameters. The device reads its own identity locally; no admin rights are needed:
 
@@ -83,7 +83,7 @@ Trade-off: this is a shared-key-per-tool design, not per-device authentication. 
    - `Send Computer Remote Wipe Command`
    - `View MDM command information in Jamf Pro API` (required but undocumented; the v2 MDM commands endpoint returns 401 without it)
 2. Create an API client assigned to that role. Its `client_id`, `client_secret`, and your Jamf URL go in the AWS secret (next section).
-3. Write a policy script that follows the client contract above, taking the gateway URL and API key as policy parameters. Don't hardcode either.
+3. Write a policy script that follows the usage example above, taking the gateway URL and API key as policy parameters. Don't hardcode either.
 
 ## AWS setup
 
@@ -172,4 +172,4 @@ Against the deployed pipeline, a fake serial like `TEST123456` exercises gateway
 
 ## License
 
-MIT. The included erase action permanently destroys data.
+MIT.
