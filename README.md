@@ -1,16 +1,14 @@
 # Jamf API Middleware
 
-Run scripts on managed Macs that trigger Jamf Pro API actions, without putting Jamf API credentials on the device.
+Run scripts on managed Macs that trigger Jamf Pro API actions without putting Jamf API credentials on the device.
 
-This is a small, production-tested implementation of the middleware pattern: AWS API Gateway + Lambda + Secrets Manager sitting between your fleet and the Jamf Pro API. A device asks the middleware to perform an action on itself. The middleware holds the credentials, verifies the device is who it says it is, and makes the Jamf API call. It runs in production on a K-12 fleet of about 10,000 Macs.
+AWS API Gateway + Lambda + Secrets Manager sit between the fleet and the Jamf Pro API. A device asks the middleware to perform an action on itself. The middleware holds the credentials, verifies the device's identity, and makes the Jamf API call. We run this in production in a K-12 district.
 
-## The problem
+## Problem
 
-Sooner or later you want a policy script that calls the Jamf Pro API. Maybe it looks something up, maybe it triggers an MDM command. The tempting shortcut is to put an API client ID and secret in the script or its policy parameters.
+A policy script that calls the Jamf Pro API needs credentials. Putting a client ID and secret in the script or its policy parameters means a local admin or malware can recover them, and a Jamf API credential usually has broad reach. Encryption and obfuscation don't change this; the secret still has to be recoverable on the device to be used. See [Stop putting Jamf Pro API credentials on clients](https://macnotes.wordpress.com/2021/11/15/stop-putting-jamf-pro-api-credentials-on-clients/).
 
-Don't. There's no way to put a secret on a client that a local admin or malware can't extract. Encrypt it or obfuscate it all you want, it still ends up on disk or in a process listing in recoverable form, and a Jamf API credential can usually touch the whole fleet. See [Stop putting Jamf Pro API credentials on clients](https://macnotes.wordpress.com/2021/11/15/stop-putting-jamf-pro-api-credentials-on-clients/) for the canonical write-up.
-
-The accepted answer is middleware. The client authenticates to a service you control with a low-value token, and that service, which holds the real credentials, verifies the request is scoped to the device making it before doing anything. This repo is that pattern, kept as small as I could keep it.
+The standard answer is middleware. The client authenticates to a service you control with a low-value token. That service holds the real credentials and verifies the request is scoped to the device making it before doing anything.
 
 ## Architecture
 
@@ -35,9 +33,9 @@ The accepted answer is middleware. The client authenticates to a service you con
                           └──────────────────────────┘
 ```
 
-A device may only act on itself, and the middleware proves it. Every request has to carry the device's serial number and hardware UUID. The Lambda looks the serial up in Jamf and requires the UDID on the matching inventory record to agree before it dispatches the action.
+Every request must include the device's serial number and hardware UUID. The Lambda looks the serial up in Jamf and requires the UDID on the matching inventory record to agree before dispatching the action. A device can only act on itself.
 
-## What ships here
+## Contents
 
 ```
 lambda/
@@ -48,13 +46,13 @@ lambda/
   test_lambda_function.py  # 16 tests
 ```
 
-The middleware is generic. `lambda_function.py` dispatches on an `action` field through an `ACTIONS` dict, and one action is included as the worked example: `erase`, which sends an MDM Erase All Content and Settings command with Bootstrap Token and obliteration-behavior safety checks. It's the action we run in production. Swap in or add your own.
+`lambda_function.py` dispatches on an `action` field through an `ACTIONS` dict. One action is included: `erase`, which sends an MDM Erase All Content and Settings command with Bootstrap Token and obliteration-behavior checks. Adding an action is a handler function and a dict entry (see below).
 
-For a complete production consumer of this middleware (self-service EACS with SwiftDialog confirmations), see [jamf-self-service-eacs](https://github.com/07-C9/jamf-self-service-eacs).
+For a production consumer of this middleware, see [jamf-self-service-eacs](https://github.com/07-C9/jamf-self-service-eacs).
 
-## The client contract
+## Client contract
 
-Any script on a managed device can call the middleware. It needs two things, both delivered as Jamf policy parameters: the gateway URL and an API key. The device reads its own identity locally, no admin rights needed:
+Any script on a managed device can call the middleware. It needs the gateway URL and an API key, both delivered as Jamf policy parameters. The device reads its own identity locally; no admin rights are needed:
 
 ```bash
 SERIAL=$(ioreg -c IOPlatformExpertDevice -d 2 | awk -F\" '/IOPlatformSerialNumber/{print $4}')
@@ -66,36 +64,30 @@ curl -s -X POST "${GATEWAY_URL}/erase" \
   -d "{\"action\":\"erase\",\"serial\":\"${SERIAL}\",\"udid\":\"${UDID}\"}"
 ```
 
-Responses are JSON with `status`, `code`, and `message`. Error codes are explicit (`DEVICE_NOT_FOUND`, `UDID_MISMATCH`, `BST_NOT_ESCROWED`, `LOOKUP_FAILED`, `JAMF_AUTH_FAILED`, `VALIDATION_ERROR`, `INVALID_DEVICE_RECORD`, `ERASE_FAILED`), so client scripts can map them to user-facing messages. One thing to get right: read the body's `code` field before falling back to HTTP status. API Gateway itself produces a bodyless 403 (bad key) and 429 (throttled), but a 403 from the Lambda means `UDID_MISMATCH`, which is a different problem than a bad key.
+Responses are JSON with `status`, `code`, and `message`. Error codes are explicit: `DEVICE_NOT_FOUND`, `UDID_MISMATCH`, `BST_NOT_ESCROWED`, `LOOKUP_FAILED`, `JAMF_AUTH_FAILED`, `VALIDATION_ERROR`, `INVALID_DEVICE_RECORD`, `ERASE_FAILED`. Client scripts should read the body's `code` field before falling back to HTTP status. API Gateway itself returns a bodyless 403 (bad key) and 429 (throttled), but a 403 from the Lambda means `UDID_MISMATCH`, which is a different problem than a bad key.
 
 ## Security model
 
-Honest version of what protects what:
+- Jamf API credentials exist only in AWS Secrets Manager, readable only by the Lambda execution role.
+- A device can only act on itself. Serial and hardware UUID are readable locally without admin rights, but on managed Apple hardware with SIP enabled they cannot be spoofed to impersonate another device. Learning another device's serial and UDID requires Jamf console or API access.
+- The API key is throttle and audit, not the security boundary. Assume a local admin can extract it from policy logs or parameters. It only allows asking the middleware to run a scoped action against a device whose serial and UDID you already know, rate limited and logged at every layer (Jamf policy log, API Gateway, CloudWatch). Issue one key per client tool so keys can be revoked independently.
+- Least privilege per use case. Each action family gets its own Jamf API role and client with minimum privileges, stored as its own secret. An action with different needs gets a new Jamf API client, not new privileges on an existing one.
+- Destructive actions get extra checks. The erase handler refuses devices without an escrowed Bootstrap Token and sends `obliterationBehavior: DoNotObliterate`, so a device that cannot perform EACS fails cleanly instead of obliterating into an OS reinstall.
 
-Jamf API credentials exist only in AWS Secrets Manager, readable only by the Lambda execution role. Nothing on the device can leak what the device never had.
-
-A device can only act on itself. Serial and hardware UUID are both readable locally without admin rights, but on managed Apple hardware with SIP enabled they can't be spoofed to impersonate another device. Learning some other device's serial AND UDID requires Jamf console or API access. An attacker who already has that doesn't need your middleware.
-
-The API key is throttle and audit, not the security boundary. Assume a determined local admin can extract it from policy logs or parameters. All it grants is the ability to ask the middleware to run a scoped action against a device whose serial and UDID you already know, rate limited and logged at every layer (Jamf policy log, API Gateway, CloudWatch). Issue one key per client tool so any key can be revoked without breaking the others.
-
-Least privilege, per use case. Each action family gets its own Jamf API role and client with the minimum privileges, stored as its own secret. The erase client holds exactly three privileges (listed below). A future action with different needs gets a new Jamf API client, not new privileges on this one.
-
-Dangerous actions get extra checks. The erase handler refuses devices without an escrowed Bootstrap Token and sends `obliterationBehavior: DoNotObliterate`, so a device that can't perform a true EACS fails cleanly instead of obliterating itself into an OS reinstall.
-
-The trade-off: this is a shared-key-per-tool design, not per-device authentication. If you need per-device secrets for broader API access, study ChippewaChris's Gustave design (per-device secrets bootstrapped through MDM-delivered configuration profiles, described in MacAdmins Slack #jamf-api). For self-targeting actions validated against device identity, key-plus-identity-check is the community-accepted balance of risk and complexity, and Gustave's author now recommends Lambda over a self-hosted broker anyway.
+Trade-off: this is a shared-key-per-tool design, not per-device authentication. For per-device secrets and broader API access, see ChippewaChris's Gustave design (per-device secrets bootstrapped through MDM-delivered configuration profiles, described in MacAdmins Slack #jamf-api). For self-targeting actions validated against device identity, a key plus an identity check is the common pattern.
 
 ## Jamf Pro setup
 
-1. Make an API role with the minimum privileges for your action. For the included erase action that's exactly:
+1. Create an API role with the minimum privileges for your action. For the included erase action:
    - `Read Computers`
    - `Send Computer Remote Wipe Command`
-   - `View MDM command information in Jamf Pro API` - required but undocumented. The v2 MDM commands endpoint returns 401 without it. This is the one that costs people hours.
-2. Make an API client assigned to that role. Its `client_id`, `client_secret`, and your Jamf URL go in the AWS secret (next section).
-3. Write a policy script that follows the client contract above, taking the gateway URL and API key as policy parameters. Never hardcode either.
+   - `View MDM command information in Jamf Pro API` (required but undocumented; the v2 MDM commands endpoint returns 401 without it)
+2. Create an API client assigned to that role. Its `client_id`, `client_secret`, and your Jamf URL go in the AWS secret (next section).
+3. Write a policy script that follows the client contract above, taking the gateway URL and API key as policy parameters. Don't hardcode either.
 
 ## AWS setup
 
-Region and IDs are placeholders, substitute your own. `jamf.py` pins its Secrets Manager client to `us-west-2`, so change that to your region.
+Region and IDs are placeholders. `jamf.py` pins its Secrets Manager client to `us-west-2`; change that to your region.
 
 ```bash
 # 1. Secret holding the Jamf API client credentials (one secret per Jamf API client)
@@ -137,7 +129,7 @@ aws apigateway update-rest-api --rest-api-id <API_ID> --patch-operations \
   "op=replace,path=/securityPolicy,value=SecurityPolicy_TLS13_1_2_2021_06"
 ```
 
-Write real descriptions on every resource. You will thank yourself in a year.
+Write real descriptions on every resource.
 
 ## Adding an action
 
@@ -156,28 +148,28 @@ ACTIONS = {
 }
 ```
 
-Then add a new API Gateway resource for the action, and if its Jamf privileges differ, a new Jamf API role, client, and secret. `jamf.validate_device()` gives every action the same device-identity guarantee for free.
+Then add an API Gateway resource for the action, and if its Jamf privileges differ, a new Jamf API role, client, and secret. `jamf.validate_device()` gives every action the same device-identity check.
 
-## Gotchas that cost us real time
+## Gotchas
 
-1. `View MDM command information in Jamf Pro API` is required to *send* commands via the v2 MDM endpoint, even though you're not viewing anything. Without it: 401.
-2. The `pin` field is required in v2 MDM `commandData` for ERASE_DEVICE, even on Apple Silicon where it's ignored. Without `"pin": "000000"`: Jamf returns 500 `SYSTEM_EXCEPTION`.
-3. Use the v2 MDM endpoint, not v1. `POST /api/v1/computer-inventory/{id}/erase` doesn't support `obliterationBehavior`. `POST /api/v2/mdm/commands` does.
+1. `View MDM command information in Jamf Pro API` is required to send commands via the v2 MDM endpoint, even though nothing is being viewed. Without it: 401.
+2. The `pin` field is required in v2 MDM `commandData` for ERASE_DEVICE, even on Apple Silicon where it is ignored. Without `"pin": "000000"`: Jamf returns 500 `SYSTEM_EXCEPTION`.
+3. Use the v2 MDM endpoint, not v1. `POST /api/v1/computer-inventory/{id}/erase` does not support `obliterationBehavior`. `POST /api/v2/mdm/commands` does.
 4. Lookup by serial uses RSQL filtering, not a direct endpoint: `GET /api/v1/computers-inventory?filter=hardware.serialNumber=="SERIAL"`. Expect zero or one result and treat anything else as a failure.
-5. API Gateway's plain `TLS_1_2` security policy value only works on custom domains. On the API itself you need the enhanced policy names (step 6 above), which also require `endpointAccessMode`.
+5. API Gateway's plain `TLS_1_2` security policy value only works on custom domains. On the API itself, use the enhanced policy names (step 6 above), which also require `endpointAccessMode`.
 
-## Testing it safely
+## Testing
 
 The test suite needs no AWS or Jamf access: `cd lambda && python3 -m pytest` (22 tests).
 
-For the deployed pipeline, a fake serial like `TEST123456` exercises everything (gateway auth, secret read, Jamf OAuth, inventory lookup) and comes back `DEVICE_NOT_FOUND` without touching any real device. We run it as a smoke test after every infrastructure change. And test destructive actions against a device on your desk before scoping any policy wider.
+Against the deployed pipeline, a fake serial like `TEST123456` exercises gateway auth, the secret read, Jamf OAuth, and the inventory lookup, and returns `DEVICE_NOT_FOUND` without touching any real device. Useful as a smoke test after infrastructure changes. Test destructive actions on a device you can afford to lose before scoping any policy wider.
 
 ## Prior art and credits
 
 - [Stop putting Jamf Pro API credentials on clients](https://macnotes.wordpress.com/2021/11/15/stop-putting-jamf-pro-api-credentials-on-clients/) - the canonical statement of the problem.
-- Gustave by ChippewaChris - the most thoroughly described general-purpose Jamf middleware design (per-device secret bootstrapping), shared in MacAdmins Slack #jamf-api and at the PSU MacAdmins conference.
-- The MacAdmins Slack #jamf-api community, whose middleware discussions shaped the threat model here.
+- Gustave by ChippewaChris - a general-purpose Jamf middleware design with per-device secret bootstrapping, shared in MacAdmins Slack #jamf-api and at the PSU MacAdmins conference.
+- The MacAdmins Slack #jamf-api community.
 
 ## License
 
-MIT. The included example action permanently destroys data by design. Read every line and test on hardware you can afford to lose before you scope it to anything real.
+MIT. The included erase action permanently destroys data.
