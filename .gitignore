@@ -3,3 +3,4 @@ __pycache__/
 .DS_Store
 *.zip
 project_journal.md
+rotation-workspace/
